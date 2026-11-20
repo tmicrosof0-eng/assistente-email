@@ -1,5 +1,5 @@
 """
-Assistente AI via email, collegato a Gemini (piano gratuito).
+Assistente AI via email, collegato a Groq (piano gratuito).
 
 Uso:
   python assistente.py          -> gira all'infinito, controlla ogni 2 minuti (per PC / Raspberry)
@@ -8,44 +8,45 @@ Uso:
 Variabili d'ambiente richieste:
   GMAIL_ADDRESS        indirizzo Gmail dell'assistente
   GMAIL_APP_PASSWORD   password per le app di quell'account Gmail
-  GEMINI_API_KEY       chiave API da Google AI Studio
+  GROQ_API_KEY         chiave API da console.groq.com
   ALLOWED_SENDERS      i tuoi indirizzi autorizzati, separati da virgola
 
 Variabili opzionali:
-  GEMINI_MODEL         modello da usare (default: gemini-3.8-flash)
+  GROQ_MODEL           modello da provare per primo
 """
 import email
 import imaplib
+import json
 import os
 import smtplib
 import sys
 import time
+import urllib.error
+import urllib.request
 from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.utils import parseaddr
 
-from google import genai
-from google.genai import types
-
 GMAIL = os.environ["GMAIL_ADDRESS"]
 APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"].replace(" ", "")
 ALLOWED = {a.strip().lower() for a in os.environ["ALLOWED_SENDERS"].split(",") if a.strip()}
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+GROQ_API_KEY = os.environ["GROQ_API_KEY"].strip()
+
+# Modelli provati in ordine: se uno non funziona, passa al successivo
+MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-20b"]
+if os.environ.get("GROQ_MODEL"):
+    MODELS.insert(0, os.environ["GROQ_MODEL"].strip())
+
+API_URL = "https://api.groq.com/openai/v1/chat/completions"
 CHECK_EVERY_SECONDS = 120
-MAX_ATTEMPTS = 3
-GEMINI_TIMEOUT_MS = 40000   # 40 secondi per ogni richiesta
-NET_TIMEOUT = 30            # secondi per Gmail
+AI_TIMEOUT = 40      # secondi per ogni richiesta all'AI
+NET_TIMEOUT = 30     # secondi per Gmail
 
 SYSTEM_PROMPT = (
     "Sei un assistente che risponde a email. Rispondi nella stessa lingua "
     "in cui è scritta la richiesta. Scrivi in testo semplice, senza markdown "
     "(niente asterischi, cancelletti o tabelle), in modo chiaro e utile, "
     "come in una email ben scritta."
-)
-
-client = genai.Client(
-    api_key=os.environ["GEMINI_API_KEY"],
-    http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
 )
 
 
@@ -91,27 +92,47 @@ def send_reply(to, subject, text, msg_id):
         smtp.send_message(out)
 
 
-def ask_gemini(prompt):
-    """Chiede a Gemini, riprovando se il server è sovraccarico o non risponde."""
+def call_model(model, prompt):
+    body = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.7,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        API_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+            "User-Agent": "email-assistant/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=AI_TIMEOUT) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    text = (data["choices"][0]["message"]["content"] or "").strip()
+    if not text:
+        raise RuntimeError("risposta vuota")
+    return text
+
+
+def ask_ai(prompt):
+    """Prova i modelli in ordine finché uno risponde."""
     last_error = None
-    for attempt in range(MAX_ATTEMPTS):
-        log(f"Chiedo a Gemini ({MODEL}), tentativo {attempt + 1}/{MAX_ATTEMPTS}...")
+    for model in MODELS:
+        log(f"Chiedo a Groq ({model})...")
         try:
-            response = client.models.generate_content(
-                model=MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-            )
-            text = (response.text or "").strip()
-            if not text:
-                raise RuntimeError("risposta vuota da Gemini")
-            return text
+            return call_model(model, prompt)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")[:300]
+            last_error = f"HTTP {e.code}: {detail}"
         except Exception as e:
-            last_error = e
-            log(f"Tentativo {attempt + 1} fallito: {e}")
-            if attempt < MAX_ATTEMPTS - 1:
-                time.sleep(10 * (attempt + 1))
-    raise last_error
+            last_error = str(e)
+        log(f"Modello {model} non ha funzionato: {last_error}")
+        time.sleep(3)
+    raise RuntimeError(last_error)
 
 
 def check_inbox():
@@ -137,9 +158,9 @@ def check_inbox():
         prompt = f"Oggetto: {subject}\n\n{body}".strip()
 
         try:
-            answer = ask_gemini(prompt)
+            answer = ask_ai(prompt)
         except Exception as e:
-            log(f"Gemini non ha risposto ({e}); riprovo al prossimo giro.")
+            log(f"Nessun modello ha risposto ({e}); riprovo al prossimo giro.")
             imap.store(num, "-FLAGS", "\\Seen")  # la rimette come non letta
             continue
 
