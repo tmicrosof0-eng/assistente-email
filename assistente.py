@@ -12,7 +12,7 @@ Variabili d'ambiente richieste:
   ALLOWED_SENDERS      i tuoi indirizzi autorizzati, separati da virgola
 
 Variabili opzionali:
-  GEMINI_MODEL         modello da usare (default: gemini-2.5-flash)
+  GEMINI_MODEL         modello da usare (default: gemini-3.8-flash)
 """
 import email
 import imaplib
@@ -32,6 +32,7 @@ APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"].replace(" ", "")
 ALLOWED = {a.strip().lower() for a in os.environ["ALLOWED_SENDERS"].split(",") if a.strip()}
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 CHECK_EVERY_SECONDS = 120
+MAX_ATTEMPTS = 4
 
 SYSTEM_PROMPT = (
     "Sei un assistente che risponde a email. Rispondi nella stessa lingua "
@@ -82,12 +83,25 @@ def send_reply(to, subject, text, msg_id):
 
 
 def ask_gemini(prompt):
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-    )
-    return (response.text or "").strip()
+    """Chiede a Gemini, riprovando se il server è sovraccarico."""
+    last_error = None
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            response = client.models.generate_content(
+                model=MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+            )
+            text = (response.text or "").strip()
+            if not text:
+                raise RuntimeError("risposta vuota da Gemini")
+            return text
+        except Exception as e:
+            last_error = e
+            print(f"Tentativo {attempt + 1}/{MAX_ATTEMPTS} fallito: {e}")
+            if attempt < MAX_ATTEMPTS - 1:
+                time.sleep(10 * (attempt + 1))
+    raise last_error
 
 
 def check_inbox():
@@ -111,10 +125,8 @@ def check_inbox():
 
         try:
             answer = ask_gemini(prompt)
-            if not answer:
-                raise RuntimeError("risposta vuota da Gemini")
         except Exception as e:
-            print(f"Errore Gemini ({e}); riprovo al prossimo giro.")
+            print(f"Gemini non ha risposto ({e}); riprovo al prossimo giro.")
             imap.store(num, "-FLAGS", "\\Seen")  # la rimette come non letta
             continue
 
