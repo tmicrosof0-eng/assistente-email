@@ -32,7 +32,9 @@ APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"].replace(" ", "")
 ALLOWED = {a.strip().lower() for a in os.environ["ALLOWED_SENDERS"].split(",") if a.strip()}
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 CHECK_EVERY_SECONDS = 120
-MAX_ATTEMPTS = 4
+MAX_ATTEMPTS = 3
+GEMINI_TIMEOUT_MS = 40000   # 40 secondi per ogni richiesta
+NET_TIMEOUT = 30            # secondi per Gmail
 
 SYSTEM_PROMPT = (
     "Sei un assistente che risponde a email. Rispondi nella stessa lingua "
@@ -41,7 +43,14 @@ SYSTEM_PROMPT = (
     "come in una email ben scritta."
 )
 
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+client = genai.Client(
+    api_key=os.environ["GEMINI_API_KEY"],
+    http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
+)
+
+
+def log(*args):
+    print(*args, flush=True)
 
 
 def get_text(msg):
@@ -77,15 +86,16 @@ def send_reply(to, subject, text, msg_id):
         out["In-Reply-To"] = msg_id
         out["References"] = msg_id
     out.set_content(text)
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=NET_TIMEOUT) as smtp:
         smtp.login(GMAIL, APP_PASSWORD)
         smtp.send_message(out)
 
 
 def ask_gemini(prompt):
-    """Chiede a Gemini, riprovando se il server è sovraccarico."""
+    """Chiede a Gemini, riprovando se il server è sovraccarico o non risponde."""
     last_error = None
     for attempt in range(MAX_ATTEMPTS):
+        log(f"Chiedo a Gemini ({MODEL}), tentativo {attempt + 1}/{MAX_ATTEMPTS}...")
         try:
             response = client.models.generate_content(
                 model=MODEL,
@@ -98,25 +108,28 @@ def ask_gemini(prompt):
             return text
         except Exception as e:
             last_error = e
-            print(f"Tentativo {attempt + 1}/{MAX_ATTEMPTS} fallito: {e}")
+            log(f"Tentativo {attempt + 1} fallito: {e}")
             if attempt < MAX_ATTEMPTS - 1:
                 time.sleep(10 * (attempt + 1))
     raise last_error
 
 
 def check_inbox():
-    imap = imaplib.IMAP4_SSL("imap.gmail.com")
+    log("Mi collego a Gmail...")
+    imap = imaplib.IMAP4_SSL("imap.gmail.com", timeout=NET_TIMEOUT)
     imap.login(GMAIL, APP_PASSWORD)
     imap.select("INBOX")
     _, data = imap.search(None, "UNSEEN")
+    ids = data[0].split()
+    log(f"Email non lette trovate: {len(ids)}")
 
-    for num in data[0].split():
+    for num in ids:
         _, raw = imap.fetch(num, "(RFC822)")
         msg = email.message_from_bytes(raw[0][1])
         sender = parseaddr(msg["From"])[1].lower()
 
         if sender not in ALLOWED:
-            print(f"Ignorata email da mittente non autorizzato: {sender}")
+            log(f"Ignorata email da mittente non autorizzato: {sender}")
             continue
 
         subject = str(make_header(decode_header(msg["Subject"] or ""))) or "(senza oggetto)"
@@ -126,14 +139,15 @@ def check_inbox():
         try:
             answer = ask_gemini(prompt)
         except Exception as e:
-            print(f"Gemini non ha risposto ({e}); riprovo al prossimo giro.")
+            log(f"Gemini non ha risposto ({e}); riprovo al prossimo giro.")
             imap.store(num, "-FLAGS", "\\Seen")  # la rimette come non letta
             continue
 
         send_reply(sender, subject, answer, msg["Message-ID"])
-        print(f"Risposto a {sender}: {subject}")
+        log(f"Risposto a {sender}: {subject}")
 
     imap.logout()
+    log("Fine controllo.")
 
 
 def main():
@@ -144,7 +158,7 @@ def main():
         try:
             check_inbox()
         except Exception as e:
-            print("Errore:", e)
+            log("Errore:", e)
         time.sleep(CHECK_EVERY_SECONDS)
 
 
