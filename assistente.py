@@ -30,7 +30,7 @@ from google.genai import types
 GMAIL = os.environ["GMAIL_ADDRESS"]
 APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"].replace(" ", "")
 ALLOWED = {a.strip().lower() for a in os.environ["ALLOWED_SENDERS"].split(",") if a.strip()}
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 CHECK_EVERY_SECONDS = 120
 
 SYSTEM_PROMPT = (
